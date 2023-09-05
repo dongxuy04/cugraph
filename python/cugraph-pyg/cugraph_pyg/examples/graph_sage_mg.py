@@ -93,8 +93,8 @@ def init_pytorch_worker(rank, devices, manager_ip, manager_port) -> None:
 
 def start_cugraph_dask_client(rank, dask_scheduler_file):
     print(
-        "Connecting to dask... "
-        "(warning: this may take a while depending on your configuration)"
+        f"rank={rank} Connecting to dask... "
+        f"(warning: this may take a while depending on your configuration)"
     )
     start_time_connect_dask = time.perf_counter_ns()
     from distributed import Client
@@ -129,6 +129,7 @@ def train(
     dask_scheduler_file: str,
     num_epochs: int,
     features_on_gpu=True,
+    feature_store_backend="torch",
 ) -> None:
     """
     Parameters
@@ -138,6 +139,8 @@ def train(
     features_on_gpu: bool
         Whether to store a replica of features on each worker's GPU.  If False,
         all features will be stored on the CPU.
+    feature_store_backend: str
+        The backend of FeatureStorage
     """
 
     start_time_preprocess = time.perf_counter_ns()
@@ -147,6 +150,14 @@ def train(
     features_device = device_id if features_on_gpu else "cpu"
     init_pytorch_worker(rank, torch_devices, manager_ip, manager_port)
     td.barrier()
+    if feature_store_backend == "wholegraph":
+        import pylibwholegraph.torch as wgth
+        world_rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        local_rank = rank
+        local_size = world_size
+        wgth.init(world_rank, world_size, local_rank, local_size)
+        print(f"rank={rank} wholegraph inti done", flush=True)
 
     client = start_cugraph_dask_client(rank, dask_scheduler_file)
 
@@ -182,7 +193,7 @@ def train(
     }
     N = {"paper": data[0]["num_nodes_dict"]["paper"]}
 
-    fs = cugraph.gnn.FeatureStore(backend="torch")
+    fs = cugraph.gnn.FeatureStore(backend=feature_store_backend)
 
     fs.add_data(
         torch.as_tensor(data[0]["node_feat_dict"]["paper"], device=features_device),
@@ -190,7 +201,7 @@ def train(
         "x",
     )
 
-    fs.add_data(torch.as_tensor(data[1]["paper"].T[0], device=device_id), "paper", "y")
+    fs.add_data_no_cast(torch.as_tensor(data[1]["paper"].T[0], device=device_id), "paper", "y")
 
     num_papers = data[0]["num_nodes_dict"]["paper"]
 
@@ -202,7 +213,7 @@ def train(
 
         train_mask = torch.full((num_papers,), -1, device=device_id)
         train_mask[train_nodes] = 1
-        fs.add_data(train_mask, "paper", "train")
+        fs.add_data_no_cast(train_mask, "paper", "train")
 
     print(f"Rank {rank} finished loading graph and feature data")
 
@@ -232,7 +243,7 @@ def train(
 
             train_mask = torch.full((num_papers,), -1, device=device_id)
             train_mask[train_nodes] = 1
-            fs.add_data(train_mask, "paper", "train")
+            fs.add_data_no_cast(train_mask, "paper", "train")
 
             # Will automatically use the stored distributed cugraph graph on rank 0.
             cugraph_store_create_start = time.perf_counter_ns()
@@ -356,6 +367,9 @@ def train(
         client.unpublish_dataset("train_nodes")
         event.clear()
 
+    if feature_store_backend == "wholegraph":
+        wgth.finalize()
+
     td.destroy_process_group()
 
 
@@ -408,6 +422,15 @@ def parse_args():
         required=True,
     )
 
+    parser.add_argument(
+        "--feature_store_backend",
+        type=str,
+        default="wholegraph",
+        choices=["torch", "wholegraph"],
+        help="The backend of feature storage",
+        required=False,
+    )
+
     return parser.parse_args()
 
 
@@ -423,6 +446,7 @@ def main():
         args.dask_scheduler_file,
         args.num_epochs,
         args.features_on_gpu,
+        args.feature_store_backend,
     )
 
     tmp.spawn(train, args=train_args, nprocs=len(torch_devices))
